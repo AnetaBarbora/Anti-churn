@@ -1,0 +1,52 @@
+-------------------------------------------------
+--------------Vytvoreni tabulky DRV--------------
+--------------------------------------------------
+CREATE OR REPLACE TABLE DRV as
+with drv_kill as --tabulka řidičů a jejich počet mrtvol 
+    (select last_driver_r, count(1) as num_kill 
+     from pass_datamart
+     where active_pass = '0'
+     group by last_driver_r 
+     order by num_kill desc
+    )
+, drv_nu as --tabulka počtů řidičů a jejich jízd --POZOR: zahrnuje pouze jizdy, ktere maji hodnoceni od pasazera (bez hodnoceni je 249,424 z 855,501 jizd)
+    (select "driverId", count(1) as num_rides 
+     from orders
+     where "rideDistance" is not NULL
+     --and "pasToDrvRating" is not NULL
+     and "orderCreatedAt" <= to_date ('3.2.2019', 'dd.mm.yyyy') -- bereme pouze jízdy do 3.2.2019
+     group by "driverId"
+     order by "driverId"
+    )
+, drv_rides as --tabulka jizd ridicu podle poradi
+    (select row_number() over (partition by "driverId" order by "orderCreatedAt" desc) as rn_ride -- poradi jizd ridice
+     , orders.* 
+     from orders
+     where "rideDistance" is not NULL
+     and "pasToDrvRating" is not NULL
+     and "orderCreatedAt" <= to_date ('3.2.2019', 'dd.mm.yyyy') -- bereme pouze jízdy do 3.2.2019
+     )
+, drv_rides_last_100 as --tabulka omezení na poslednich 100 jizd ridicu
+    (select * from drv_rides
+     where rn_ride < 101
+    )
+, drv_rate as -- tabulka s průmerným hodnocení na posledních 100 jizdách
+    (select distinct("driverId"), round (AVG ("pasToDrvRating") OVER (partition by "driverId"), 2) as AVG_RATING 
+     from drv_rides_last_100
+     order by "driverId"
+    )
+, drv_enum as -- číselník pro id řidičů, aby tam byly jenom čísla
+    (select row_number() over (order by "driverId") as driver_id
+     ,"driverId" from drv_rate)
+
+select dr."driverId"
+, de. driver_id
+, dn.num_rides
+, ifnull (dk.num_kill,0) as num_kill
+, ifnull (round (dk.num_kill/dn.num_rides, 2),0) as kill_rate
+, dr.avg_rating
+from drv_nu dn 
+left join drv_rate dr on dn."driverId"=dr."driverId"
+left join drv_kill dk on dk.last_driver_r=dr."driverId"
+left join drv_enum de on de."driverId" = dr."driverId"
+order by kill_rate desc;
