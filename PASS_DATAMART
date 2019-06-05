@@ -1,0 +1,238 @@
+------------------------------------------------------------------
+--------TABULKA PASS ---------------------------------------------
+------------------------------------------------------------------
+-- pasazeri - ti co udělali alespon 3 jízdy ----------------------
+-- a jejich uskutečněné jizdy-------------------------------------
+-- bereme v potaz pouze jízdy do 3.2.2019 včetně------------------
+
+create or replace table "PASS" as
+select * from INQUIRY
+where 1=1
+and "passengerId" in (select distinct ("passengerId") from INQUIRY 
+where "rideState" in ('FINISHED') 
+and "rideFinishedAt_UTC" <= to_date ('3.2.2019', 'dd.mm.yyyy') -- za pass bereme pouze ty, kteri udelali 3 jizdy do 3.2.2019
+group by "passengerId"
+having count(1) > 2) -- vyberu si jenom pasažéry, kteří udělali alespon 3 jízdy
+and "rideState" in ('FINISHED');
+
+-----------------------------------------------------------------
+--------TABULKA PASS_RATE_ETA------------------------------------
+-----------------------------------------------------------------
+-- průměrné hodnocení pass a průměrná eta pass-------------------
+-- pouze na jízdách do 3.2.2019 včetně---------------------------
+
+create or replace table PASS_RATE_ETA as
+with x as 
+(select p."passengerId",
+   case when o."pasToDrvRating" is null then 5 -- pokud nehodnotí zákazník, tak předpokládáme, že je spokojeny
+    else o."pasToDrvRating"
+    end as "pasToDrvRating_r",
+   round(avg("pasToDrvRating_r") over (partition by p."passengerId" order by p."passengerId"),2) as avg_rate_pass_to_drv,
+   case when p."taxiETA" = 0 then 0.5 -- pokud eta je nula nahrazujeme 0.5
+    else p."taxiETA"
+    end taxi_ETA_r, --nový sloupeček pro ety s nenulovymi etami
+   round(avg (taxi_ETA_r) over (partition by p."passengerId" order by p."passengerId"),2) as avg_eta ,
+   row_number () over (partition by p."passengerId" order by p."passengerId") as rn
+ from pass p
+ left join orders o on o."orderID" = p."orderID"
+ order by p."passengerId")
+ 
+select "passengerId", avg_rate_pass_to_drv, avg_eta from x
+where rn=1;
+
+------------------------------------------------------------------
+--------TABULKA PASS_NUM_ORDERS ----------------------------------
+------------------------------------------------------------------
+--- počet poptávek zákazníka i nerealizované----------------------
+--- do 3.2.2019 včetně--------------------------------------------
+
+create or replace table "PASS_NUM_ORDERS" as
+with 
+x as ( select distinct ("orderID"||"passengerId") as orders, "passengerId","orderBroadcastedAt"
+        from inquiry
+        where 1=1
+        and "passengerId" in 
+            (select distinct ("passengerId") from INQUIRY 
+            where "rideState" in ('FINISHED')
+            and "rideFinishedAt_UTC" <= to_date ('3.2.2019', 'dd.mm.yyyy')
+            group by "passengerId"
+            having count(1) > 2))
+    
+select "passengerId", count(1) as num_orders
+from x
+where "orderBroadcastedAt" <= to_date ('3.2.2019', 'dd.mm.yyyy') --berem v potaz pouze poptávky do 3.2.2019
+group by "passengerId"
+order by num_orders asc;
+
+------------------------------------------------------------------
+--------TABULKA PASS_NUM_RIDES -----------------------------------
+------------------------------------------------------------------
+--- odjetý počet jízd---------------------------------------------
+create or replace table "PASS_NUM_RIDES" as
+select "passengerId", count(1) as num_rides -- celkový počet odjetých jízd
+from pass
+group by "passengerId"
+order by num_rides asc;
+
+------------------------------------------------------------------
+--------TABULKA PASS_PAYER_TYPE-----------------------------------
+------------------------------------------------------------------
+-- určení o jaký typ pasažéra se jedná podle druhu plateb --------
+
+CREATE OR REPLACE TABLE "PASS_PAYER_TYPE" AS
+with 
+x as ( select p."passengerId",
+       case when o."payerProfileType" = 'CORPORATE' 
+        then 1 -- ke corporate přičítá +1 a k personal a business(zahrnujeme do personal) odečítá -1 
+        else (-1)
+        end as payerProfileType_n,
+       sum (payerProfileType_n) over (partition by p."passengerId" order by p."passengerId") as type_p -- sečtení napočtu přes pasažera
+       from pass p
+       left join orders o on o."orderID" = p."orderID" -- propojení se s tabulkou orders, abychom zjistili payerProfill
+       order by p."passengerId")
+
+select distinct("passengerId"),
+case when type_p >= 0  --- pokud po sečtení vyjde kladné číslo, pasažér jel víc jízd jako corporate a naopak
+ then 1  ---'CORPORATE'
+ else 0 ---'PERSONAL'
+ end as PAYER_TYPE  -- tím si určím o jaký typ zakazníka se jedná, podle nejčastějšího typu platby
+from x;
+
+------------------------------------------------------------------
+--------TABULKA PASS_REGION---------------------------------------
+------------------------------------------------------------------
+---- určení domácího regionu, kde nejvíce jezdí pasažér ----------
+-- vyberu si jenom region s největším počtem jizd a ten určím jako HOMEREGION
+
+create or replace table "PASS_HOME_REGION" as
+with pass_reg as (
+select "passengerId",
+"orderRegion",
+count(1) over (partition by "passengerId"||"orderRegion" order by "passengerId") as count_region -- počet jízd v jednotlivých region per passenger
+from pass
+order by "passengerId"),
+
+order_pass_reg as (
+select 
+row_number () over (partition by "passengerId" order by count_region desc) rn, -- seřazení podle počtu jízd v regionech od nejvíce jízd po nejméně
+"orderRegion",
+"passengerId",
+count_region
+from pass_reg)
+
+select "passengerId", "orderRegion" as "HOME_REGION" from order_pass_reg
+where rn = 1;
+
+------------------------------------------------------------------
+--------ČÍSELNÍK PRO HOME_REGION ---------------------------------
+------------------------------------------------------------------
+create or replace table "REGION_ENUM" as
+with region as 
+(select distinct(home_region) from pass_home_region)
+
+select row_number() over(order by home_region) as home_region_id,r.*
+from region r;
+
+------------------------------------------------------------------
+--------TABULKA PASS_LAST_RIDES-----------------------------------
+------------------------------------------------------------------
+-- informace o poslední jízdě zákazníka - kdy byla, s kým, č.objednávka  - dá se doplnit eta atd 
+-- bez omezení na 3.2.2019---------------------------------------
+
+create or replace table "PASS_LAST_RIDES" as
+with
+pass_last as (select * from INQUIRY
+where 1=1
+and "passengerId" in (select distinct ("passengerId") from INQUIRY 
+where "rideState" in ('FINISHED')
+and "rideFinishedAt_UTC" <= to_date ('3.2.2019', 'dd.mm.yyyy')
+group by "passengerId"
+having count(1) > 2) -- vyberu si jenom pasažéry, kteří udělali alespon 3 jízdy bez omezení
+and "rideState" in ('FINISHED')),
+
+pass_rn as (
+select 
+row_number() over (partition by "passengerId" order by "rideFinishedAt_UTC" desc) as rn_last_ride, -- očíslování jízd od nejnovější po nejstarší
+pass_last.*
+from pass_last 
+order by "passengerId")
+
+select "passengerId", "orderID" as last_order, "driverId" as last_driver, "rideFinishedAt_UTC" as last_ride 
+from pass_rn
+where rn_last_ride=1;
+
+------------------------------------------------------------------
+--------TABULKA PASS_LAST_RIDES_R---------------------------------
+------------------------------------------------------------------
+---- POSLEDNÍ JÍZDA UPRAVENÁ/REGULOVANÁ, která byla před nebo včetně 3.2.2019
+
+create or replace table "PASS_LAST_RIDES_R" as
+with pass_rn as (
+select row_number() over (partition by "passengerId" order by "rideFinishedAt_UTC" desc) as rn, -- očíslování jízd od nejnovější po nejstarší
+pass.*
+from pass 
+where "rideFinishedAt_UTC" <= to_date ('3.2.2019', 'dd.mm.yyyy') 
+order by "passengerId")
+
+select "passengerId", "orderID" as last_order_r, "driverId" as last_driver_r, "rideFinishedAt_UTC" as last_ride_r
+from pass_rn
+where rn=1;
+
+------------------------------------------------------------------
+--------TABULKA PASS_FIRST_RIDES----------------------------------
+------------------------------------------------------------------
+-- informace o první jízdě zákazníka - kdy byla ------------------
+create or replace table "PASS_FIRST_RIDES" as
+with pass_rn as (
+select row_number() over (partition by "passengerId" order by "rideFinishedAt_UTC" asc) as rn_first_ride, -- očíslování jízd od nejstarší po nejnovější
+pass.*
+from pass 
+order by "passengerId")
+
+select "passengerId","rideFinishedAt_UTC" as first_ride
+from pass_rn
+where rn_first_ride=1;
+
+------------------------------------------------------------------
+--------TABULKA PASS_ACT------------------------------------------
+------------------------------------------------------------------
+-- příznak aktivní a neaktivní zákazník---------------------------
+
+create or replace table  PASS_ACT AS
+select "passengerId",
+case when last_ride >= to_date ('3.2.2019', 'dd.mm.yyyy')   -- vyhodnocení aktivní a neaktivní pass
+then '1' -- ANO - aktivní zákazník 
+else '0' -- NE - neaktivní zákazník, ti co udělali poslední před 3.2.2019
+end as active_pass
+from pass_last_rides;
+
+------------------------------------------------------------------
+----- TABULKA PASS_DATAMART ---------------------------------------
+-------------------------------------------------------------------
+create or replace table  PASS_DATAMART AS
+
+select pa."passengerId",
+phr.home_region, -- můžeme vynechat, máme místo toho id_home_region
+re.home_region_id,
+ppt.payer_type,
+pnr.num_rides,
+pno.num_orders,
+round(pnr.num_rides/pno.num_orders,2) as ride2order,
+pfr.first_ride,
+plrr.last_ride_r,
+datediff (day,pfr.first_ride, plrr.last_ride_r) as duration,
+pre.avg_rate_pass_to_drv,
+pre.avg_eta,
+plrr.last_order_r,
+plrr.last_driver_r,
+pa.active_pass
+
+from pass_last_rides_r plrr
+left join pass_first_rides pfr on plrr."passengerId" = pfr."passengerId"
+left join pass_home_region phr on plrr."passengerId" = phr."passengerId"
+left join pass_num_orders pno on plrr."passengerId" = pno."passengerId"
+left join pass_num_rides pnr on plrr."passengerId" = pnr."passengerId"
+left join pass_payer_type ppt on plrr."passengerId" = ppt."passengerId"
+left join pass_rate_eta pre on pre."passengerId" = plrr."passengerId"
+left join region_enum re on re.home_region = phr.home_region
+left join pass_act pa on pa."passengerId" = plrr."pa
