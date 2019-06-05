@@ -1,0 +1,37 @@
+CREATE OR REPLACE TABLE LAST_RIDES 
+as
+with last_rides as
+(
+  with orders_p as --Pridani sloupce "passengerId" do tabulky ORDERS a vyfiltrovani pouze jizd, ktere probehly 90 dnu pred posledni "rideFinishedAt" celeho datasetu
+    (select o."orderID", o."driverId", i."passengerId",i."rideFinishedAt_UTC", o."pasToDrvRating",o."drvToPasRating"
+            , o."rideDistance", i."rideEstimateDistance"
+            , (o."rideDistance"- i."rideEstimateDistance") as diff_distance --skutecna minus odhadovana vzdalenost (kladne hodnoty => zakaznik platil vic nez ocekaval)
+            , iff(i."taxiETA"= 0, 0.5,"taxiETA") as "taxiETA"
+     from ORDERS o
+     left join INQUIRY i
+     on o."orderID" = i."orderID" and o."driverId" = i."driverId" 
+     where o."rideDistance" is not null and o."rideDistance" <> 0 and i."rideState" = 'FINISHED'
+     and "rideFinishedAt_UTC" <= to_date ('3.2.2019', 'dd.mm.yyyy') -- bereme pouze jízdy do 3.2.2019
+    )
+  select "passengerId", "orderID"--serazeni jizd vsech zakazniku od jejich posledni do minulosti
+  , row_number() over (partition by "passengerId" order by "rideFinishedAt_UTC" desc) as "rn_pass_ride"
+  , sum("rideDistance") over (partition by "passengerId" order by "passengerId") as total_distance --celková vzdáleností všech jízd zákazníka
+  , "rideFinishedAt_UTC","driverId", "pasToDrvRating","drvToPasRating","taxiETA","rideDistance","rideEstimateDistance"
+  , ifnull(diff_distance,0) as diff_distance
+  from ORDERS_P
+)
+select 
+ "passengerId", "orderID", "driverId","pasToDrvRating"
+ , ifnull ("drvToPasRating",5) as "drvToPasRating"
+ , "taxiETA","rideDistance"
+ , ifnull ("rideEstimateDistance",0) as "rideEstimateDistance"
+ , diff_distance
+ , total_distance
+from last_rides
+where "rn_pass_ride" = 1 --vybrana pouze 1 posledni jizda kazdeho zakaznika
+and "passengerId" in --pouze zakaznici (min. 3 uskutecnene jizdy)
+    (select distinct ("passengerId") from INQUIRY 
+     where "rideState" in ('FINISHED')
+     group by "passengerId"
+     having count(1) > 2)
+;
