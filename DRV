@@ -1,6 +1,3 @@
--------------------------------------------------
---------------Vytvoreni tabulky DRV--------------
---------------------------------------------------
 CREATE OR REPLACE TABLE DRV as
 with drv_kill as --tabulka řidičů a jejich počet mrtvol 
     (select last_driver_r, count(1) as num_kill 
